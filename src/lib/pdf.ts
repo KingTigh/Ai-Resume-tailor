@@ -3,65 +3,64 @@ import { Buffer } from "buffer";
 import { createRequire } from "module";
 import { pathToFileURL } from "url";
 
+// Optional: helps pdfjs on server envs that expect DOMMatrix/ImageData/Path2D
 async function ensureCanvasPolyfills() {
-  const mod: any = await import("@napi-rs/canvas");
+  try {
+    const mod: any = await import("@napi-rs/canvas");
+    const DOMMatrix = mod?.DOMMatrix ?? mod?.default?.DOMMatrix;
+    const ImageData = mod?.ImageData ?? mod?.default?.ImageData;
+    const Path2D = mod?.Path2D ?? mod?.default?.Path2D;
 
-  const DOMMatrix = mod.DOMMatrix ?? mod.default?.DOMMatrix;
-  const ImageData = mod.ImageData ?? mod.default?.ImageData;
-  const Path2D = mod.Path2D ?? mod.default?.Path2D;
-
-  if (!DOMMatrix || !ImageData || !Path2D) {
-    throw new Error("Failed to load @napi-rs/canvas exports (DOMMatrix/ImageData/Path2D).");
+    if (DOMMatrix && !(globalThis as any).DOMMatrix) (globalThis as any).DOMMatrix = DOMMatrix;
+    if (ImageData && !(globalThis as any).ImageData) (globalThis as any).ImageData = ImageData;
+    if (Path2D && !(globalThis as any).Path2D) (globalThis as any).Path2D = Path2D;
+  } catch {
+    // If canvas polyfills aren't available, we'll try anyway.
+    // (Some builds only need text extraction and won't hit canvas paths.)
   }
-
-  (globalThis as any).DOMMatrix ??= DOMMatrix;
-  (globalThis as any).ImageData ??= ImageData;
-  (globalThis as any).Path2D ??= Path2D;
 }
 
 async function loadPdfJs() {
-  // Bypass Next's resolver: resolve the real file path using Node, then import by file URL.
+  await ensureCanvasPolyfills();
+
+  const mod: any = await import("pdfjs-dist");
+  const pdfjs: any = mod?.default ?? mod;
+
+  // Explicitly point workerSrc to a file that actually exists in the package.
+  // This prevents "Setting up fake worker failed" on serverless.
   const require = createRequire(import.meta.url);
 
-  const candidates = [
-    "pdfjs-dist/legacy/build/pdf.mjs",
-    "pdfjs-dist/legacy/build/pdf.js",
-    "pdfjs-dist/legacy/build/pdf",
+  const workerCandidates = [
+    "pdfjs-dist/build/pdf.worker.min.mjs",
+    "pdfjs-dist/build/pdf.worker.mjs",
+    "pdfjs-dist/legacy/build/pdf.worker.min.js",
+    "pdfjs-dist/legacy/build/pdf.worker.js",
   ];
 
-  let resolved: string | null = null;
-
-  for (const spec of candidates) {
+  let workerPath: string | null = null;
+  for (const spec of workerCandidates) {
     try {
-      resolved = require.resolve(spec);
+      workerPath = require.resolve(spec);
       break;
     } catch {
       // keep trying
     }
   }
 
-  if (!resolved) {
-    throw new Error(
-      `Could not resolve pdfjs-dist legacy build. Tried: ${candidates.join(", ")}`
-    );
+  if (workerPath) {
+    // pdfjs expects a URL-like string in many environments
+    pdfjs.GlobalWorkerOptions.workerSrc = pathToFileURL(workerPath).href;
   }
 
-  const url = pathToFileURL(resolved).href;
-  const mod: any = await import(url);
-
-  // pdfjs sometimes exports as default, sometimes as named module object
-  return mod?.default ?? mod;
+  return pdfjs;
 }
 
 export async function extractTextFromPdf(buffer: Buffer): Promise<string> {
-  await ensureCanvasPolyfills();
-
-  // ✅ Avoid deep imports like pdfjs-dist/legacy/build/pdf.mjs
-  const mod: any = await import("pdfjs-dist");
-  const pdfjs: any = mod?.default ?? mod;
+  const pdfjs = await loadPdfJs();
 
   const data = new Uint8Array(buffer);
 
+  // Disable workers in serverless (safe + avoids worker import issues)
   const loadingTask = pdfjs.getDocument({
     data,
     disableWorker: true,
