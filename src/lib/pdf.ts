@@ -1,6 +1,7 @@
 // src/lib/pdf.ts
 import { Buffer } from "buffer";
 import path from "node:path";
+import fs from "node:fs";
 import { pathToFileURL } from "url";
 
 async function ensureCanvasPolyfills() {
@@ -18,15 +19,35 @@ async function ensureCanvasPolyfills() {
   }
 }
 
+function getVendoredWorkerPath(): string {
+  const vendorDir = path.join(process.cwd(), "src", "lib", "vendor");
+  const manifestPath = path.join(vendorDir, "pdf-worker.json");
+
+  if (!fs.existsSync(manifestPath)) {
+    throw new Error(
+      `pdfjs worker manifest not found at ${manifestPath}. Run: node scripts/copy-pdf-worker.mjs`
+    );
+  }
+
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as { file?: string };
+  const file = manifest.file;
+  if (!file) throw new Error(`pdfjs worker manifest missing "file" key: ${manifestPath}`);
+
+  const workerPath = path.join(vendorDir, file);
+  if (!fs.existsSync(workerPath)) {
+    throw new Error(`pdfjs worker file not found at ${workerPath}. Re-run copy script.`);
+  }
+
+  return workerPath;
+}
+
 async function loadPdfJs() {
   await ensureCanvasPolyfills();
 
-  // ✅ Modern pdfjs-dist: legacy build is typically ESM (.mjs) only
   const mod: any = await import("pdfjs-dist/legacy/build/pdf.mjs");
   const pdfjs: any = mod?.default ?? mod;
 
-  // ✅ Worker is vendored into repo by scripts/copy-pdf-worker.mjs
-  const workerFsPath = path.join(process.cwd(), "src", "lib", "vendor", "pdf.worker.mjs");
+  const workerFsPath = getVendoredWorkerPath();
   pdfjs.GlobalWorkerOptions.workerSrc = pathToFileURL(workerFsPath).href;
 
   return pdfjs;
@@ -36,8 +57,6 @@ export async function extractTextFromPdf(buffer: Buffer): Promise<string> {
   const pdfjs = await loadPdfJs();
   const data = new Uint8Array(buffer);
 
-  // Even with disableWorker, pdf.js uses a "fake worker" that imports workerSrc.
-  // workerSrc MUST point to a real file (our vendored worker).
   const loadingTask = pdfjs.getDocument({
     data,
     disableWorker: true,
