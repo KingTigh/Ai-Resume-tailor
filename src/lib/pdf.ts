@@ -28,7 +28,8 @@ async function loadPdfJs() {
 
   // Explicitly point workerSrc to a file that actually exists in the package.
   // This prevents "Setting up fake worker failed" on serverless.
-  const require = createRequire(import.meta.url);
+  const require = createRequire(process.cwd() + "/");
+
 
   const workerCandidates = [
     "pdfjs-dist/build/pdf.worker.min.mjs",
