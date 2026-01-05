@@ -3,7 +3,8 @@ import { Buffer } from "buffer";
 import { createRequire } from "module";
 import { pathToFileURL } from "url";
 
-// Optional: helps pdfjs on server envs that expect DOMMatrix/ImageData/Path2D
+const req = createRequire(process.cwd() + "/");
+
 async function ensureCanvasPolyfills() {
   try {
     const mod: any = await import("@napi-rs/canvas");
@@ -15,43 +16,68 @@ async function ensureCanvasPolyfills() {
     if (ImageData && !(globalThis as any).ImageData) (globalThis as any).ImageData = ImageData;
     if (Path2D && !(globalThis as any).Path2D) (globalThis as any).Path2D = Path2D;
   } catch {
-    // If canvas polyfills aren't available, we'll try anyway.
-    // (Some builds only need text extraction and won't hit canvas paths.)
+    // ok
   }
+}
+
+function resolveFirst(candidates: string[]) {
+  for (const spec of candidates) {
+    try {
+      return req.resolve(spec);
+    } catch {
+      // keep trying
+    }
+  }
+  return null;
 }
 
 async function loadPdfJs() {
   await ensureCanvasPolyfills();
 
-  const mod: any = await import("pdfjs-dist");
-  const pdfjs: any = mod?.default ?? mod;
-
-  // Explicitly point workerSrc to a file that actually exists in the package.
-  // This prevents "Setting up fake worker failed" on serverless.
-  const require = createRequire(process.cwd() + "/");
-
-
+  // 1) Resolve a worker file that actually exists
   const workerCandidates = [
     "pdfjs-dist/build/pdf.worker.min.mjs",
     "pdfjs-dist/build/pdf.worker.mjs",
+    "pdfjs-dist/build/pdf.worker.min.js",
+    "pdfjs-dist/build/pdf.worker.js",
     "pdfjs-dist/legacy/build/pdf.worker.min.js",
     "pdfjs-dist/legacy/build/pdf.worker.js",
   ];
 
-  let workerPath: string | null = null;
-  for (const spec of workerCandidates) {
-    try {
-      workerPath = require.resolve(spec);
-      break;
-    } catch {
-      // keep trying
-    }
+  const workerPath = resolveFirst(workerCandidates);
+  if (!workerPath) {
+    throw new Error(
+      `Could not resolve a pdf.js worker. Tried: ${workerCandidates.join(", ")}`
+    );
   }
 
-  if (workerPath) {
-    // pdfjs expects a URL-like string in many environments
-    pdfjs.GlobalWorkerOptions.workerSrc = pathToFileURL(workerPath).href;
+  // 2) Load pdf.js (legacy build is most reliable on Node/serverless)
+  const pdfCandidates = [
+    "pdfjs-dist/legacy/build/pdf.js",
+    "pdfjs-dist/legacy/build/pdf.mjs",
+    "pdfjs-dist/build/pdf.js",
+    "pdfjs-dist/build/pdf.mjs",
+    "pdfjs-dist",
+  ];
+
+  const pdfPath = resolveFirst(pdfCandidates);
+  if (!pdfPath) {
+    throw new Error(`Could not resolve pdfjs-dist. Tried: ${pdfCandidates.join(", ")}`);
   }
+
+  // Prefer require() for the legacy CJS build where possible
+  let pdfjs: any;
+  try {
+    pdfjs = req(pdfPath);
+  } catch {
+    // Fallback to dynamic import if pdfPath is ESM
+    const mod: any = await import(pathToFileURL(pdfPath).href);
+    pdfjs = mod?.default ?? mod;
+  }
+
+  // 3) Critical: set workerSrc to an existing file BEFORE getDocument()
+  // Use file URL for ESM workers.
+  pdfjs.GlobalWorkerOptions.workerSrc = pathToFileURL(workerPath).href;
 
   return pdfjs;
 }
@@ -61,7 +87,8 @@ export async function extractTextFromPdf(buffer: Buffer): Promise<string> {
 
   const data = new Uint8Array(buffer);
 
-  // Disable workers in serverless (safe + avoids worker import issues)
+  // NOTE: even with disableWorker, pdf.js still uses "fake worker"
+  // which imports workerSrc. workerSrc MUST be resolvable.
   const loadingTask = pdfjs.getDocument({
     data,
     disableWorker: true,
