@@ -2,10 +2,14 @@
 "use client";
 
 /**
- * Improvement #5: Save history (recent tailored versions)
- * - Stores last 5 results in localStorage
- * - Lets users reopen any past result and preview/download again
- * - If localStorage quota is exceeded, stores "text-only" history entry (no binaries)
+ * page.tsx (full file)
+ * - Upload resume PDF (or paste fallback text)
+ * - Paste job description
+ * - Call /api/tailor (multipart FormData)
+ * - Preview/download PDF + DOCX in a modal
+ * - 2-column card preview
+ * - History (last 5 runs) using localStorage
+ * - NEW: ATS Keyword Match + Score (client-side)
  */
 
 import { useEffect, useMemo, useState } from "react";
@@ -70,25 +74,166 @@ type TailorResponse = {
 };
 
 /** -----------------------------
+ * ATS helpers (client-side)
+ * ----------------------------- */
+// Common stopwords + generic hiring boilerplate words
+const STOPWORDS = new Set([
+  "a",
+  "an",
+  "and",
+  "are",
+  "as",
+  "at",
+  "be",
+  "but",
+  "by",
+  "for",
+  "from",
+  "has",
+  "have",
+  "had",
+  "he",
+  "she",
+  "they",
+  "them",
+  "their",
+  "the",
+  "to",
+  "of",
+  "on",
+  "or",
+  "in",
+  "is",
+  "it",
+  "its",
+  "this",
+  "that",
+  "these",
+  "those",
+  "with",
+  "will",
+  "would",
+  "can",
+  "could",
+  "should",
+  "may",
+  "we",
+  "our",
+  "you",
+  "your",
+  "i",
+  "me",
+  "my",
+  "us",
+  "than",
+  "then",
+  "into",
+  "over",
+  "under",
+  "within",
+  "across",
+  "per",
+  "using",
+  "use",
+  "used",
+  "work",
+  "works",
+  "working",
+  "role",
+  "responsibilities",
+  "requirements",
+  "preferred",
+  "years",
+  "year",
+  "experience",
+  "strong",
+  "excellent",
+  "ability",
+  "skills",
+  "team",
+  "teams",
+  "including",
+  "plus",
+]);
+
+/**
+ * Extract keyword-like tokens from job text.
+ * - Keeps tech-ish tokens like "c++", "c#", ".net", "node.js", "aws", "ci/cd"
+ * - Removes stopwords
+ * - Returns top N by frequency
+ */
+function extractJobKeywords(jobText: string, max = 35) {
+  const raw = (jobText ?? "")
+    .replace(/[’']/g, "'")
+    .toLowerCase();
+
+  // tokens allow letters/numbers + common tech punctuation
+  const tokens = raw.match(/[a-z0-9][a-z0-9\+\#\.\-\/]{1,}/g) ?? [];
+
+  const freq = new Map<string, number>();
+
+  for (const tok of tokens) {
+    const t = tok.replace(/^[\.\-\/]+|[\.\-\/]+$/g, ""); // trim punctuation ends
+    if (/\d/.test(t)) continue; // ✅ add this line
+    // Allow a few short tech tokens; otherwise ignore < 3
+    if (t.length < 3 && !["c", "r", "go", "js", "ts"].includes(t)) continue;
+
+    if (STOPWORDS.has(t)) continue;
+
+    // collapse common variants
+    const normalized =
+      t === "typescript"
+        ? "ts"
+        : t === "javascript"
+          ? "js"
+          : t === "node"
+            ? "node.js"
+            : t;
+
+    freq.set(normalized, (freq.get(normalized) ?? 0) + 1);
+  }
+
+  return [...freq.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([k]) => k)
+    .slice(0, max);
+}
+
+function analyzeAts(jobText: string, resumeText: string) {
+  const keywords = extractJobKeywords(jobText);
+  const resume = (resumeText ?? "").toLowerCase();
+
+  const present: string[] = [];
+  const missing: string[] = [];
+
+  for (const k of keywords) {
+    // Simple contains check; v1 is intentionally lightweight
+    if (resume.includes(k)) present.push(k);
+    else missing.push(k);
+  }
+
+  const total = keywords.length || 1;
+  const score = Math.round((present.length / total) * 100);
+
+  return { score, keywords, present, missing };
+}
+
+/** -----------------------------
  * History types / storage helpers
  * ----------------------------- */
 type HistoryEntry = {
   id: string;
   createdAt: number; // epoch ms
   label: string; // short UI label
-  // inputs (optional, helpful for context)
-  jobPreview?: string;
-  // saved result
+  jobPreview?: string; // small context snippet
   result: TailorResponse;
-  // if true, downloads/previews will work from history
-  hasFiles: boolean;
+  hasFiles: boolean; // if false, base64s were stripped to fit storage
 };
 
 const HISTORY_KEY = "tailor_history_v1";
 const HISTORY_MAX = 5;
 
 function nowId() {
-  // simple unique-ish id for client side usage
   return `${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
 
@@ -109,7 +254,6 @@ function safeLoadHistory(): HistoryEntry[] {
     if (!raw) return [];
     const parsed = JSON.parse(raw) as HistoryEntry[];
     if (!Array.isArray(parsed)) return [];
-    // Defensive cleanup
     return parsed
       .filter((x) => x && typeof x.id === "string" && typeof x.createdAt === "number")
       .sort((a, b) => b.createdAt - a.createdAt)
@@ -132,7 +276,6 @@ function base64ToBlob(b64: string, mime: string) {
 }
 
 function useObjectUrl(blob: Blob | null) {
-  // Creates a temporary object URL for previews and cleans it up automatically.
   const [url, setUrl] = useState<string | null>(null);
 
   useEffect(() => {
@@ -159,7 +302,7 @@ function downloadBase64(base64: string, filename: string, mime: string) {
  * Safer fetch JSON parsing
  * ----------------------------- */
 async function safeParseTailorResponse(res: Response): Promise<TailorResponse> {
-  // Avoid “Unexpected token '<'” when server returns an HTML error page.
+  // Avoid “Unexpected token '<'” when server returns HTML error pages.
   const contentType = res.headers.get("content-type") || "";
   const rawText = await res.text();
 
@@ -171,7 +314,6 @@ async function safeParseTailorResponse(res: Response): Promise<TailorResponse> {
     }
   }
 
-  // If it looks like HTML, give a helpful error message.
   if (rawText.trim().startsWith("<!DOCTYPE") || rawText.trim().startsWith("<html")) {
     const preview = rawText.replace(/\s+/g, " ").slice(0, 220);
     throw new Error(`Server returned an HTML error page (status ${res.status}). Preview: ${preview}`);
@@ -471,7 +613,6 @@ function DocxViewer({ base64 }: { base64: string }) {
  * Main Page Component
  * ----------------------------- */
 export default function Home() {
-  const [selectedHistoryId, setSelectedHistoryId] = useState<string | null>(null);
   const [jobText, setJobText] = useState("");
   const [resumePdf, setResumePdf] = useState<File | null>(null);
   const [resumeText, setResumeText] = useState("");
@@ -491,11 +632,19 @@ export default function Home() {
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [historyInfo, setHistoryInfo] = useState<string | null>(null);
 
+  // Selected history item for UI highlighting
+  const [selectedHistoryId, setSelectedHistoryId] = useState<string | null>(null);
+
   useEffect(() => {
-    // Load history once on mount
     const entries = safeLoadHistory();
     setHistory(entries);
   }, []);
+
+  // ✅ NEW: ATS analysis computed from job text + tailored resume (ATS text)
+  const ats = useMemo(() => {
+    if (!data) return null;
+    return analyzeAts(jobText, data.tailored_resume || "");
+  }, [data, jobText]);
 
   const canSubmit = useMemo(() => {
     const hasJob = jobText.trim().length >= 50;
@@ -510,8 +659,7 @@ export default function Home() {
   }
 
   function addToHistory(result: TailorResponse) {
-    // Try to save the full result, including files (base64).
-    // If localStorage quota is exceeded, we fall back to a text-only entry.
+    // Try to save everything (including PDFs/DOCX). If quota fails, store text-only.
     const entryFull: HistoryEntry = {
       id: nowId(),
       createdAt: Date.now(),
@@ -528,11 +676,10 @@ export default function Home() {
       setHistory(next);
       setHistoryInfo(null);
       return;
-    } catch (e: any) {
-      // Likely QUOTA_EXCEEDED_ERR
+    } catch {
+      // likely QUOTA_EXCEEDED_ERR
     }
 
-    // Fallback: strip binaries to reduce size
     const stripped: TailorResponse = {
       ...result,
       resume_pdf_base64: "",
@@ -553,24 +700,21 @@ export default function Home() {
       safeSaveHistory(next2);
       setHistory(next2);
       setHistoryInfo(
-        "Saved to history without PDF/DOCX files (browser storage limit). You can still view the text/preview cards; re-run Tailor to regenerate files."
+        "Saved to history without PDF/DOCX files (browser storage limit). You can still view content; re-run Tailor to regenerate files."
       );
     } catch {
-      setHistoryInfo(
-        "Could not save to history (browser storage limit). Your current result is still on-screen."
-      );
+      setHistoryInfo("Could not save to history (browser storage limit). Your current result is still on-screen.");
     }
   }
 
   function openHistoryEntry(entry: HistoryEntry) {
     setError(null);
     setData(entry.result);
-    setSelectedHistoryId(entry.id); // ✅ mark selected
+    setSelectedHistoryId(entry.id); // ✅ highlight selected item
     if (entry.jobPreview) setJobText(entry.jobPreview);
     setHistoryInfo(entry.hasFiles ? null : "This history item was saved without files (storage limit).");
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
-
 
   function deleteHistoryEntry(id: string) {
     const next = history.filter((h) => h.id !== id);
@@ -580,10 +724,14 @@ export default function Home() {
     } catch {
       // ignore
     }
+
+    // If you delete the selected item, clear selection
+    if (selectedHistoryId === id) setSelectedHistoryId(null);
   }
 
   function clearHistory() {
     setHistory([]);
+    setSelectedHistoryId(null);
     try {
       localStorage.removeItem(HISTORY_KEY);
     } catch {
@@ -592,11 +740,11 @@ export default function Home() {
   }
 
   async function onTailor() {
-    setSelectedHistoryId(null);
     setLoading(true);
     setError(null);
     setData(null);
     setHistoryInfo(null);
+    setSelectedHistoryId(null); // ✅ new run, clear highlight
 
     try {
       const fd = new FormData();
@@ -609,7 +757,6 @@ export default function Home() {
       const json = await safeParseTailorResponse(res);
 
       if (!res.ok || json.error) throw new Error(json.error || `Request failed (${res.status})`);
-
       setData(json);
       addToHistory(json);
     } catch (e: any) {
@@ -627,8 +774,8 @@ export default function Home() {
         <header className="space-y-2">
           <h1 className="text-4xl font-semibold">AI Resume & Cover Letter Tailor</h1>
           <p className="text-white/70">
-            Upload your resume as a PDF and paste the job description. Get a tailored resume + cover
-            letter, preview them, and download as PDF or DOCX. History keeps your last 5 runs.
+            Upload your resume as a PDF and paste the job description. Get a tailored resume + cover letter,
+            preview them, download as PDF/DOCX, and see ATS keyword match.
           </p>
         </header>
 
@@ -657,12 +804,12 @@ export default function Home() {
                 <div
                   key={h.id}
                   className={`rounded-xl p-3 flex items-start justify-between gap-3 transition
-                            ${
-                              selectedHistoryId === h.id
-                                ? "border border-white/60 bg-white/10 shadow-[0_0_0_1px_rgba(255,255,255,0.4)]"
-                                : "border border-white/10 bg-black/30 hover:bg-black/40"
-                            }
-                          `}
+                    ${
+                      selectedHistoryId === h.id
+                        ? "border border-white/60 bg-white/10 shadow-[0_0_0_1px_rgba(255,255,255,0.4)]"
+                        : "border border-white/10 bg-black/30 hover:bg-black/40"
+                    }
+                  `}
                 >
                   <button
                     onClick={() => openHistoryEntry(h)}
@@ -672,7 +819,9 @@ export default function Home() {
                     <div className="text-sm font-medium text-white">{h.label}</div>
                     <div className="mt-1 text-xs text-white/60">
                       {formatDateTime(h.createdAt)}{" "}
-                      {!h.hasFiles ? <span className="text-yellow-300/80">• no files saved</span> : null}
+                      {!h.hasFiles ? (
+                        <span className="text-yellow-300/80">• no files saved</span>
+                      ) : null}
                     </div>
                   </button>
 
@@ -738,8 +887,73 @@ export default function Home() {
         {/* Results */}
         {data && (
           <section className="space-y-6 rounded-2xl border border-white/10 bg-white/5 p-6">
+            {/* ✅ NEW: ATS Score + keywords */}
+            {ats && (
+              <div className="rounded-2xl border border-white/10 bg-black/30 p-5 space-y-4">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm text-white/60">ATS Keyword Match</div>
+                    <div className="text-2xl font-semibold">
+                      {ats.score}/100{" "}
+                      <span className="text-sm font-normal text-white/60">
+                        ({ats.present.length}/{ats.keywords.length} keywords found)
+                      </span>
+                    </div>
+                  </div>
+
+                  <button
+                    className="rounded-xl px-4 py-2 bg-white/10 border border-white/15 text-white font-medium disabled:opacity-40"
+                    disabled={ats.missing.length === 0}
+                    onClick={() => navigator.clipboard.writeText(ats.missing.join(", "))}
+                    title="Copy missing keywords"
+                  >
+                    Copy missing keywords
+                  </button>
+                </div>
+
+                {/* Missing */}
+                <div>
+                  <div className="text-sm font-semibold text-white/80">
+                    Missing keywords (from job post)
+                  </div>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    {ats.missing.length ? (
+                      ats.missing.map((k) => (
+                        <span
+                          key={k}
+                          className="inline-flex items-center rounded-full border border-red-400/30 bg-red-500/10 px-3 py-1 text-xs text-red-200"
+                        >
+                          {k}
+                        </span>
+                      ))
+                    ) : (
+                      <span className="text-sm text-white/60">None — nice match.</span>
+                    )}
+                  </div>
+                </div>
+
+                {/* Present */}
+                <div>
+                  <div className="text-sm font-semibold text-white/80">Present keywords</div>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    {ats.present.slice(0, 24).map((k) => (
+                      <span
+                        key={k}
+                        className="inline-flex items-center rounded-full border border-emerald-400/30 bg-emerald-500/10 px-3 py-1 text-xs text-emerald-200"
+                      >
+                        {k}
+                      </span>
+                    ))}
+                    {ats.present.length > 24 && (
+                      <span className="text-xs text-white/60">+{ats.present.length - 24} more</span>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Download + Preview controls */}
             <div className="flex flex-wrap gap-3">
-              {/* Download */}
               <button
                 onClick={() =>
                   downloadBase64(data.resume_pdf_base64, "tailored_resume.pdf", "application/pdf")
@@ -788,7 +1002,6 @@ export default function Home() {
                 Download Cover Letter DOCX
               </button>
 
-              {/* Preview */}
               <button
                 onClick={() =>
                   setPreview({ kind: "pdf", title: "Resume PDF Preview", base64: data.resume_pdf_base64 })
@@ -815,11 +1028,7 @@ export default function Home() {
 
               <button
                 onClick={() =>
-                  setPreview({
-                    kind: "docx",
-                    title: "Resume DOCX Preview",
-                    base64: data.resume_docx_base64,
-                  })
+                  setPreview({ kind: "docx", title: "Resume DOCX Preview", base64: data.resume_docx_base64 })
                 }
                 disabled={!data.resume_docx_base64}
                 className="rounded-xl px-4 py-2 bg-white/5 border border-white/15 text-white font-medium disabled:opacity-40"
@@ -841,11 +1050,10 @@ export default function Home() {
                 Preview Cover Letter DOCX
               </button>
 
-              {/* Helpful hint if this history item has no files */}
               {!canUseFiles && (
                 <div className="w-full text-sm text-yellow-300/80">
-                  This result doesn’t include saved PDF/DOCX files (storage limit). You can still read the content
-                  and re-run Tailor to regenerate files.
+                  This result doesn’t include saved PDF/DOCX files (storage limit). You can still read the
+                  content and re-run Tailor to regenerate files.
                 </div>
               )}
             </div>
@@ -887,7 +1095,11 @@ export default function Home() {
       {/* Preview modal */}
       {preview && (
         <Modal title={preview.title} onClose={() => setPreview(null)}>
-          {preview.kind === "pdf" ? <PdfViewer base64={preview.base64} /> : <DocxViewer base64={preview.base64} />}
+          {preview.kind === "pdf" ? (
+            <PdfViewer base64={preview.base64} />
+          ) : (
+            <DocxViewer base64={preview.base64} />
+          )}
         </Modal>
       )}
     </main>
