@@ -1,7 +1,19 @@
+// src/app/page.tsx
 "use client";
 
-import { useMemo, useState } from "react";
+/**
+ * Improvement #5: Save history (recent tailored versions)
+ * - Stores last 5 results in localStorage
+ * - Lets users reopen any past result and preview/download again
+ * - If localStorage quota is exceeded, stores "text-only" history entry (no binaries)
+ */
 
+import { useEffect, useMemo, useState } from "react";
+import { renderAsync } from "docx-preview";
+
+/** -----------------------------
+ * Types (keep in sync with API)
+ * ----------------------------- */
 type ResumeLink = { label: string; url: string };
 
 type TailoredResume = {
@@ -44,44 +56,93 @@ type TailoredResume = {
 type TailorResponse = {
   original_resume: string;
   tailored_resume: string; // ATS text
-  resume: TailoredResume;  // structured JSON
+  resume: TailoredResume; // structured JSON for preview
   cover_letter: string;
+
   resume_pdf_base64: string;
   cover_letter_pdf_base64: string;
+
   resume_docx_base64: string;
   cover_letter_docx_base64: string;
+
   error?: string;
   raw?: any;
 };
 
+/** -----------------------------
+ * History types / storage helpers
+ * ----------------------------- */
+type HistoryEntry = {
+  id: string;
+  createdAt: number; // epoch ms
+  label: string; // short UI label
+  // inputs (optional, helpful for context)
+  jobPreview?: string;
+  // saved result
+  result: TailorResponse;
+  // if true, downloads/previews will work from history
+  hasFiles: boolean;
+};
+
+const HISTORY_KEY = "tailor_history_v1";
+const HISTORY_MAX = 5;
+
+function nowId() {
+  // simple unique-ish id for client side usage
+  return `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
+function formatDateTime(ms: number) {
+  const d = new Date(ms);
+  return d.toLocaleString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function safeLoadHistory(): HistoryEntry[] {
+  try {
+    const raw = localStorage.getItem(HISTORY_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as HistoryEntry[];
+    if (!Array.isArray(parsed)) return [];
+    // Defensive cleanup
+    return parsed
+      .filter((x) => x && typeof x.id === "string" && typeof x.createdAt === "number")
+      .sort((a, b) => b.createdAt - a.createdAt)
+      .slice(0, HISTORY_MAX);
+  } catch {
+    return [];
+  }
+}
+
+function safeSaveHistory(entries: HistoryEntry[]) {
+  localStorage.setItem(HISTORY_KEY, JSON.stringify(entries.slice(0, HISTORY_MAX)));
+}
+
+/** -----------------------------
+ * Base64 helpers
+ * ----------------------------- */
 function base64ToBlob(b64: string, mime: string) {
   const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
   return new Blob([bytes], { type: mime });
 }
 
-async function safeParseTailorResponse(res: Response): Promise<TailorResponse> {
-  const contentType = res.headers.get("content-type") || "";
-  const rawText = await res.text();
+function useObjectUrl(blob: Blob | null) {
+  // Creates a temporary object URL for previews and cleans it up automatically.
+  const [url, setUrl] = useState<string | null>(null);
 
-  if (contentType.includes("application/json")) {
-    try {
-      return JSON.parse(rawText) as TailorResponse;
-    } catch {
-      // fallthrough
-    }
-  }
+  useEffect(() => {
+    if (!blob) return;
+    const u = URL.createObjectURL(blob);
+    setUrl(u);
+    return () => URL.revokeObjectURL(u);
+  }, [blob]);
 
-  if (rawText.trim().startsWith("<!DOCTYPE") || rawText.trim().startsWith("<html")) {
-    const preview = rawText.replace(/\s+/g, " ").slice(0, 200);
-    throw new Error(`Server returned an HTML error page (status ${res.status}). Preview: ${preview}`);
-  }
-
-  try {
-    return JSON.parse(rawText) as TailorResponse;
-  } catch {
-    const preview = rawText.replace(/\s+/g, " ").slice(0, 220);
-    throw new Error(`Server returned non-JSON response (status ${res.status}). Preview: ${preview}`);
-  }
+  return url;
 }
 
 function downloadBase64(base64: string, filename: string, mime: string) {
@@ -94,6 +155,39 @@ function downloadBase64(base64: string, filename: string, mime: string) {
   URL.revokeObjectURL(url);
 }
 
+/** -----------------------------
+ * Safer fetch JSON parsing
+ * ----------------------------- */
+async function safeParseTailorResponse(res: Response): Promise<TailorResponse> {
+  // Avoid “Unexpected token '<'” when server returns an HTML error page.
+  const contentType = res.headers.get("content-type") || "";
+  const rawText = await res.text();
+
+  if (contentType.includes("application/json")) {
+    try {
+      return JSON.parse(rawText) as TailorResponse;
+    } catch {
+      // fall through
+    }
+  }
+
+  // If it looks like HTML, give a helpful error message.
+  if (rawText.trim().startsWith("<!DOCTYPE") || rawText.trim().startsWith("<html")) {
+    const preview = rawText.replace(/\s+/g, " ").slice(0, 220);
+    throw new Error(`Server returned an HTML error page (status ${res.status}). Preview: ${preview}`);
+  }
+
+  try {
+    return JSON.parse(rawText) as TailorResponse;
+  } catch {
+    const preview = rawText.replace(/\s+/g, " ").slice(0, 220);
+    throw new Error(`Server returned non-JSON response (status ${res.status}). Preview: ${preview}`);
+  }
+}
+
+/** -----------------------------
+ * Reusable UI building blocks
+ * ----------------------------- */
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <div className="rounded-xl border border-white/10 bg-black/30 p-4">
@@ -112,6 +206,9 @@ function Chip({ children }: { children: React.ReactNode }) {
   );
 }
 
+/** -----------------------------
+ * Resume Preview (2-column cards)
+ * ----------------------------- */
 function ResumePreview({ resume }: { resume: TailoredResume }) {
   const h = resume.header;
 
@@ -124,7 +221,7 @@ function ResumePreview({ resume }: { resume: TailoredResume }) {
     .filter(Boolean)
     .join(" • ");
 
- return (
+  return (
     <div className="space-y-4">
       {/* Header stays full width */}
       <div className="rounded-xl border border-white/10 bg-white/5 p-4">
@@ -132,7 +229,7 @@ function ResumePreview({ resume }: { resume: TailoredResume }) {
         {meta && <div className="mt-1 text-sm text-white/70">{meta}</div>}
       </div>
 
-      {/* Two-column grid for the cards */}
+      {/* Two-column grid for the main cards (stacks on mobile) */}
       <div className="grid gap-4 lg:grid-cols-2 items-start">
         {/* LEFT COLUMN */}
         <div className="space-y-4">
@@ -189,9 +286,7 @@ function ResumePreview({ resume }: { resume: TailoredResume }) {
               {!resume.skills?.languages?.length &&
                 !resume.skills?.frameworks?.length &&
                 !resume.skills?.tools?.length &&
-                !resume.skills?.other?.length && (
-                  <div className="text-sm text-white/80">—</div>
-                )}
+                !resume.skills?.other?.length && <div className="text-sm text-white/80">—</div>}
             </div>
           </Section>
 
@@ -287,7 +382,96 @@ function ResumePreview({ resume }: { resume: TailoredResume }) {
   );
 }
 
+/** -----------------------------
+ * Preview Modal + PDF/DOCX viewers
+ * ----------------------------- */
+function Modal({
+  title,
+  onClose,
+  children,
+}: {
+  title: string;
+  onClose: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
+      <div className="w-full max-w-5xl rounded-2xl border border-white/10 bg-zinc-950 shadow-xl">
+        <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
+          <div className="text-sm font-semibold">{title}</div>
+          <button
+            onClick={onClose}
+            className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-sm text-white/80 hover:bg-white/10"
+          >
+            Close
+          </button>
+        </div>
+
+        <div className="h-[80vh] overflow-auto p-4">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+function PdfViewer({ base64 }: { base64: string }) {
+  const blob = useMemo(() => base64ToBlob(base64, "application/pdf"), [base64]);
+  const url = useObjectUrl(blob);
+  if (!url) return <div className="text-white/70">Loading PDF…</div>;
+
+  return (
+    <iframe
+      title="PDF Preview"
+      src={url}
+      className="h-[78vh] w-full rounded-xl border border-white/10 bg-black"
+    />
+  );
+}
+
+function DocxViewer({ base64 }: { base64: string }) {
+  const blob = useMemo(
+    () =>
+      base64ToBlob(
+        base64,
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+      ),
+    [base64]
+  );
+
+  const [mounted, setMounted] = useState(false);
+
+  useEffect(() => setMounted(true), []);
+
+  useEffect(() => {
+    if (!mounted) return;
+    const container = document.getElementById("docx-preview-container");
+    if (!container) return;
+    container.innerHTML = "";
+
+    renderAsync(blob, container, undefined, {
+      className: "docx",
+      inWrapper: true,
+      ignoreWidth: false,
+      ignoreHeight: false,
+      ignoreFonts: false,
+      breakPages: true,
+      renderChanges: false,
+      experimental: false,
+    });
+  }, [blob, mounted]);
+
+  return (
+    <div
+      id="docx-preview-container"
+      className="rounded-xl border border-white/10 bg-white p-4 text-black"
+    />
+  );
+}
+
+/** -----------------------------
+ * Main Page Component
+ * ----------------------------- */
 export default function Home() {
+  const [selectedHistoryId, setSelectedHistoryId] = useState<string | null>(null);
   const [jobText, setJobText] = useState("");
   const [resumePdf, setResumePdf] = useState<File | null>(null);
   const [resumeText, setResumeText] = useState("");
@@ -296,20 +480,128 @@ export default function Home() {
   const [data, setData] = useState<TailorResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  // Preview modal state
+  const [preview, setPreview] = useState<
+    | null
+    | { kind: "pdf"; title: string; base64: string }
+    | { kind: "docx"; title: string; base64: string }
+  >(null);
+
+  // History state (loaded from localStorage on mount)
+  const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const [historyInfo, setHistoryInfo] = useState<string | null>(null);
+
+  useEffect(() => {
+    // Load history once on mount
+    const entries = safeLoadHistory();
+    setHistory(entries);
+  }, []);
+
   const canSubmit = useMemo(() => {
     const hasJob = jobText.trim().length >= 50;
     const hasResume = !!resumePdf || resumeText.trim().length >= 50;
     return hasJob && hasResume && !loading;
   }, [jobText, resumePdf, resumeText, loading]);
 
+  function makeLabelFromJob(text: string) {
+    const oneLine = text.replace(/\s+/g, " ").trim();
+    if (!oneLine) return "Tailor Run";
+    return oneLine.slice(0, 60) + (oneLine.length > 60 ? "…" : "");
+  }
+
+  function addToHistory(result: TailorResponse) {
+    // Try to save the full result, including files (base64).
+    // If localStorage quota is exceeded, we fall back to a text-only entry.
+    const entryFull: HistoryEntry = {
+      id: nowId(),
+      createdAt: Date.now(),
+      label: makeLabelFromJob(jobText),
+      jobPreview: jobText.slice(0, 240),
+      result,
+      hasFiles: true,
+    };
+
+    const next = [entryFull, ...history].slice(0, HISTORY_MAX);
+
+    try {
+      safeSaveHistory(next);
+      setHistory(next);
+      setHistoryInfo(null);
+      return;
+    } catch (e: any) {
+      // Likely QUOTA_EXCEEDED_ERR
+    }
+
+    // Fallback: strip binaries to reduce size
+    const stripped: TailorResponse = {
+      ...result,
+      resume_pdf_base64: "",
+      cover_letter_pdf_base64: "",
+      resume_docx_base64: "",
+      cover_letter_docx_base64: "",
+    };
+
+    const entryTextOnly: HistoryEntry = {
+      ...entryFull,
+      result: stripped,
+      hasFiles: false,
+    };
+
+    const next2 = [entryTextOnly, ...history].slice(0, HISTORY_MAX);
+
+    try {
+      safeSaveHistory(next2);
+      setHistory(next2);
+      setHistoryInfo(
+        "Saved to history without PDF/DOCX files (browser storage limit). You can still view the text/preview cards; re-run Tailor to regenerate files."
+      );
+    } catch {
+      setHistoryInfo(
+        "Could not save to history (browser storage limit). Your current result is still on-screen."
+      );
+    }
+  }
+
+  function openHistoryEntry(entry: HistoryEntry) {
+    setError(null);
+    setData(entry.result);
+    setSelectedHistoryId(entry.id); // ✅ mark selected
+    if (entry.jobPreview) setJobText(entry.jobPreview);
+    setHistoryInfo(entry.hasFiles ? null : "This history item was saved without files (storage limit).");
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+
+
+  function deleteHistoryEntry(id: string) {
+    const next = history.filter((h) => h.id !== id);
+    setHistory(next);
+    try {
+      safeSaveHistory(next);
+    } catch {
+      // ignore
+    }
+  }
+
+  function clearHistory() {
+    setHistory([]);
+    try {
+      localStorage.removeItem(HISTORY_KEY);
+    } catch {
+      // ignore
+    }
+  }
+
   async function onTailor() {
+    setSelectedHistoryId(null);
     setLoading(true);
     setError(null);
     setData(null);
+    setHistoryInfo(null);
 
     try {
       const fd = new FormData();
       fd.append("jobText", jobText);
+
       if (resumePdf) fd.append("resumePdf", resumePdf);
       if (resumeText.trim().length) fd.append("resumeText", resumeText);
 
@@ -317,13 +609,17 @@ export default function Home() {
       const json = await safeParseTailorResponse(res);
 
       if (!res.ok || json.error) throw new Error(json.error || `Request failed (${res.status})`);
+
       setData(json);
+      addToHistory(json);
     } catch (e: any) {
       setError(e?.message || "Something went wrong");
     } finally {
       setLoading(false);
     }
   }
+
+  const canUseFiles = !!data?.resume_pdf_base64 && !!data?.cover_letter_pdf_base64;
 
   return (
     <main className="min-h-screen px-6 py-10 bg-black text-white">
@@ -332,10 +628,68 @@ export default function Home() {
           <h1 className="text-4xl font-semibold">AI Resume & Cover Letter Tailor</h1>
           <p className="text-white/70">
             Upload your resume as a PDF and paste the job description. Get a tailored resume + cover
-            letter, and download both as PDFs or DOCX.
+            letter, preview them, and download as PDF or DOCX. History keeps your last 5 runs.
           </p>
         </header>
 
+        {/* History Bar */}
+        <section className="rounded-2xl border border-white/10 bg-white/5 p-5">
+          <div className="flex items-center justify-between gap-3">
+            <div className="text-sm font-semibold">History (last {HISTORY_MAX})</div>
+            <div className="flex gap-2">
+              <button
+                onClick={clearHistory}
+                disabled={!history.length}
+                className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-sm text-white/80 hover:bg-white/10 disabled:opacity-40"
+              >
+                Clear all
+              </button>
+            </div>
+          </div>
+
+          {historyInfo && <div className="mt-3 text-sm text-white/70">{historyInfo}</div>}
+
+          {!history.length ? (
+            <div className="mt-3 text-sm text-white/60">No saved runs yet.</div>
+          ) : (
+            <div className="mt-4 grid gap-2 md:grid-cols-2">
+              {history.map((h) => (
+                <div
+                  key={h.id}
+                  className={`rounded-xl p-3 flex items-start justify-between gap-3 transition
+                            ${
+                              selectedHistoryId === h.id
+                                ? "border border-white/60 bg-white/10 shadow-[0_0_0_1px_rgba(255,255,255,0.4)]"
+                                : "border border-white/10 bg-black/30 hover:bg-black/40"
+                            }
+                          `}
+                >
+                  <button
+                    onClick={() => openHistoryEntry(h)}
+                    className="text-left flex-1"
+                    title="Open this saved result"
+                  >
+                    <div className="text-sm font-medium text-white">{h.label}</div>
+                    <div className="mt-1 text-xs text-white/60">
+                      {formatDateTime(h.createdAt)}{" "}
+                      {!h.hasFiles ? <span className="text-yellow-300/80">• no files saved</span> : null}
+                    </div>
+                  </button>
+
+                  <button
+                    onClick={() => deleteHistoryEntry(h.id)}
+                    className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-white/80 hover:bg-white/10"
+                    title="Delete this history item"
+                  >
+                    Delete
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+
+        {/* Inputs */}
         <section className="grid gap-4 md:grid-cols-2">
           <div className="space-y-2">
             <label className="text-sm text-white/70">Resume PDF (recommended)</label>
@@ -369,6 +723,7 @@ export default function Home() {
           </div>
         </section>
 
+        {/* Action */}
         <button
           onClick={onTailor}
           disabled={!canSubmit}
@@ -377,28 +732,30 @@ export default function Home() {
           {loading ? "Tailoring..." : "Tailor for this job"}
         </button>
 
+        {/* Errors */}
         {error && <p className="text-red-400 whitespace-pre-wrap">{error}</p>}
 
+        {/* Results */}
         {data && (
           <section className="space-y-6 rounded-2xl border border-white/10 bg-white/5 p-6">
             <div className="flex flex-wrap gap-3">
+              {/* Download */}
               <button
                 onClick={() =>
                   downloadBase64(data.resume_pdf_base64, "tailored_resume.pdf", "application/pdf")
                 }
-                className="rounded-xl px-4 py-2 bg-white text-black font-medium"
+                disabled={!data.resume_pdf_base64}
+                className="rounded-xl px-4 py-2 bg-white text-black font-medium disabled:opacity-40"
               >
                 Download Resume PDF
               </button>
+
               <button
                 onClick={() =>
-                  downloadBase64(
-                    data.cover_letter_pdf_base64,
-                    "cover_letter.pdf",
-                    "application/pdf"
-                  )
+                  downloadBase64(data.cover_letter_pdf_base64, "cover_letter.pdf", "application/pdf")
                 }
-                className="rounded-xl px-4 py-2 bg-white/90 text-black font-medium"
+                disabled={!data.cover_letter_pdf_base64}
+                className="rounded-xl px-4 py-2 bg-white/90 text-black font-medium disabled:opacity-40"
               >
                 Download Cover Letter PDF
               </button>
@@ -411,7 +768,8 @@ export default function Home() {
                     "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                   )
                 }
-                className="rounded-xl px-4 py-2 bg-white/10 border border-white/15 text-white font-medium"
+                disabled={!data.resume_docx_base64}
+                className="rounded-xl px-4 py-2 bg-white/10 border border-white/15 text-white font-medium disabled:opacity-40"
               >
                 Download Resume DOCX
               </button>
@@ -424,13 +782,75 @@ export default function Home() {
                     "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                   )
                 }
-                className="rounded-xl px-4 py-2 bg-white/10 border border-white/15 text-white font-medium"
+                disabled={!data.cover_letter_docx_base64}
+                className="rounded-xl px-4 py-2 bg-white/10 border border-white/15 text-white font-medium disabled:opacity-40"
               >
                 Download Cover Letter DOCX
               </button>
+
+              {/* Preview */}
+              <button
+                onClick={() =>
+                  setPreview({ kind: "pdf", title: "Resume PDF Preview", base64: data.resume_pdf_base64 })
+                }
+                disabled={!data.resume_pdf_base64}
+                className="rounded-xl px-4 py-2 bg-white/5 border border-white/15 text-white font-medium disabled:opacity-40"
+              >
+                Preview Resume PDF
+              </button>
+
+              <button
+                onClick={() =>
+                  setPreview({
+                    kind: "pdf",
+                    title: "Cover Letter PDF Preview",
+                    base64: data.cover_letter_pdf_base64,
+                  })
+                }
+                disabled={!data.cover_letter_pdf_base64}
+                className="rounded-xl px-4 py-2 bg-white/5 border border-white/15 text-white font-medium disabled:opacity-40"
+              >
+                Preview Cover Letter PDF
+              </button>
+
+              <button
+                onClick={() =>
+                  setPreview({
+                    kind: "docx",
+                    title: "Resume DOCX Preview",
+                    base64: data.resume_docx_base64,
+                  })
+                }
+                disabled={!data.resume_docx_base64}
+                className="rounded-xl px-4 py-2 bg-white/5 border border-white/15 text-white font-medium disabled:opacity-40"
+              >
+                Preview Resume DOCX
+              </button>
+
+              <button
+                onClick={() =>
+                  setPreview({
+                    kind: "docx",
+                    title: "Cover Letter DOCX Preview",
+                    base64: data.cover_letter_docx_base64,
+                  })
+                }
+                disabled={!data.cover_letter_docx_base64}
+                className="rounded-xl px-4 py-2 bg-white/5 border border-white/15 text-white font-medium disabled:opacity-40"
+              >
+                Preview Cover Letter DOCX
+              </button>
+
+              {/* Helpful hint if this history item has no files */}
+              {!canUseFiles && (
+                <div className="w-full text-sm text-yellow-300/80">
+                  This result doesn’t include saved PDF/DOCX files (storage limit). You can still read the content
+                  and re-run Tailor to regenerate files.
+                </div>
+              )}
             </div>
 
-            {/* Preview + ATS comparison */}
+            {/* Side-by-side comparison + preview */}
             <div className="grid gap-4 md:grid-cols-2">
               <div className="rounded-xl border border-white/10 bg-black/30 p-4">
                 <h2 className="text-lg font-semibold">Original Resume (extracted)</h2>
@@ -463,6 +883,13 @@ export default function Home() {
           </section>
         )}
       </div>
+
+      {/* Preview modal */}
+      {preview && (
+        <Modal title={preview.title} onClose={() => setPreview(null)}>
+          {preview.kind === "pdf" ? <PdfViewer base64={preview.base64} /> : <DocxViewer base64={preview.base64} />}
+        </Modal>
+      )}
     </main>
   );
 }
