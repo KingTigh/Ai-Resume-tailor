@@ -9,7 +9,8 @@
  * - Preview/download PDF + DOCX in a modal
  * - 2-column card preview
  * - History (last 5 runs) using localStorage
- * - NEW: ATS Keyword Match + Score (client-side)
+ * - ATS Keyword Match + Score (client-side)
+ * - Inline bullet editing + Regenerate PDFs/DOCX from edits
  */
 
 import { useEffect, useMemo, useState } from "react";
@@ -76,119 +77,40 @@ type TailorResponse = {
 /** -----------------------------
  * ATS helpers (client-side)
  * ----------------------------- */
-// Common stopwords + generic hiring boilerplate words
 const STOPWORDS = new Set([
-  "a",
-  "an",
-  "and",
-  "are",
-  "as",
-  "at",
-  "be",
-  "but",
-  "by",
-  "for",
-  "from",
-  "has",
-  "have",
-  "had",
-  "he",
-  "she",
-  "they",
-  "them",
-  "their",
-  "the",
-  "to",
-  "of",
-  "on",
-  "or",
-  "in",
-  "is",
-  "it",
-  "its",
-  "this",
-  "that",
-  "these",
-  "those",
-  "with",
-  "will",
-  "would",
-  "can",
-  "could",
-  "should",
-  "may",
-  "we",
-  "our",
-  "you",
-  "your",
-  "i",
-  "me",
-  "my",
-  "us",
-  "than",
-  "then",
-  "into",
-  "over",
-  "under",
-  "within",
-  "across",
-  "per",
-  "using",
-  "use",
-  "used",
-  "work",
-  "works",
-  "working",
-  "role",
-  "responsibilities",
-  "requirements",
-  "preferred",
-  "years",
-  "year",
-  "experience",
-  "strong",
-  "excellent",
-  "ability",
-  "skills",
-  "team",
-  "teams",
-  "including",
-  "plus",
+  "a","an","and","are","as","at","be","but","by","for","from","has","have","had",
+  "he","she","they","them","their","the","to","of","on","or","in","is","it","its",
+  "this","that","these","those","with","will","would","can","could","should","may",
+  "we","our","you","your","i","me","my","us","than","then","into","over","under",
+  "within","across","per","using","use","used","work","works","working","role",
+  "responsibilities","requirements","preferred","years","year","experience",
+  "strong","excellent","ability","skills","team","teams","including","plus"
 ]);
 
-/**
- * Extract keyword-like tokens from job text.
- * - Keeps tech-ish tokens like "c++", "c#", ".net", "node.js", "aws", "ci/cd"
- * - Removes stopwords
- * - Returns top N by frequency
- */
 function extractJobKeywords(jobText: string, max = 35) {
   const raw = (jobText ?? "")
     .replace(/[’']/g, "'")
     .toLowerCase();
 
-  // tokens allow letters/numbers + common tech punctuation
+  // tech-friendly tokens
   const tokens = raw.match(/[a-z0-9][a-z0-9\+\#\.\-\/]{1,}/g) ?? [];
 
   const freq = new Map<string, number>();
 
   for (const tok of tokens) {
-    const t = tok.replace(/^[\.\-\/]+|[\.\-\/]+$/g, ""); // trim punctuation ends
-    if (/\d/.test(t)) continue; // ✅ add this line
-    // Allow a few short tech tokens; otherwise ignore < 3
-    if (t.length < 3 && !["c", "r", "go", "js", "ts"].includes(t)) continue;
+    const t = tok.replace(/^[\.\-\/]+|[\.\-\/]+$/g, "");
 
+    // ✅ EXCLUDE anything that contains a digit
+    if (/\d/.test(t)) continue;
+
+    if (t.length < 3 && !["c","r","go","js","ts"].includes(t)) continue;
     if (STOPWORDS.has(t)) continue;
 
-    // collapse common variants
     const normalized =
-      t === "typescript"
-        ? "ts"
-        : t === "javascript"
-          ? "js"
-          : t === "node"
-            ? "node.js"
-            : t;
+      t === "typescript" ? "ts" :
+      t === "javascript" ? "js" :
+      t === "node" ? "node.js" :
+      t;
 
     freq.set(normalized, (freq.get(normalized) ?? 0) + 1);
   }
@@ -207,7 +129,6 @@ function analyzeAts(jobText: string, resumeText: string) {
   const missing: string[] = [];
 
   for (const k of keywords) {
-    // Simple contains check; v1 is intentionally lightweight
     if (resume.includes(k)) present.push(k);
     else missing.push(k);
   }
@@ -223,11 +144,11 @@ function analyzeAts(jobText: string, resumeText: string) {
  * ----------------------------- */
 type HistoryEntry = {
   id: string;
-  createdAt: number; // epoch ms
-  label: string; // short UI label
-  jobPreview?: string; // small context snippet
+  createdAt: number;
+  label: string;
+  jobPreview?: string;
   result: TailorResponse;
-  hasFiles: boolean; // if false, base64s were stripped to fit storage
+  hasFiles: boolean;
 };
 
 const HISTORY_KEY = "tailor_history_v1";
@@ -299,10 +220,9 @@ function downloadBase64(base64: string, filename: string, mime: string) {
 }
 
 /** -----------------------------
- * Safer fetch JSON parsing
+ * Safer fetch parsing
  * ----------------------------- */
 async function safeParseTailorResponse(res: Response): Promise<TailorResponse> {
-  // Avoid “Unexpected token '<'” when server returns HTML error pages.
   const contentType = res.headers.get("content-type") || "";
   const rawText = await res.text();
 
@@ -310,7 +230,7 @@ async function safeParseTailorResponse(res: Response): Promise<TailorResponse> {
     try {
       return JSON.parse(rawText) as TailorResponse;
     } catch {
-      // fall through
+      // fallthrough
     }
   }
 
@@ -328,7 +248,7 @@ async function safeParseTailorResponse(res: Response): Promise<TailorResponse> {
 }
 
 /** -----------------------------
- * Reusable UI building blocks
+ * UI building blocks
  * ----------------------------- */
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
@@ -349,9 +269,70 @@ function Chip({ children }: { children: React.ReactNode }) {
 }
 
 /** -----------------------------
- * Resume Preview (2-column cards)
+ * Editable bullet
  * ----------------------------- */
-function ResumePreview({ resume }: { resume: TailoredResume }) {
+function EditableBullet({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (next: string) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(value);
+
+  // keep draft in sync when switching history items / regenerating
+  useEffect(() => setDraft(value), [value]);
+
+  if (!editing) {
+    return (
+      <li
+        className="cursor-pointer rounded-md px-1 py-0.5 hover:bg-white/5"
+        title="Click to edit"
+        onClick={() => setEditing(true)}
+      >
+        {value}
+      </li>
+    );
+  }
+
+  return (
+    <li className="list-none">
+      <input
+        autoFocus
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={() => {
+          setEditing(false);
+          onChange(draft.trim() ? draft : value);
+        }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            (e.target as HTMLInputElement).blur();
+          }
+          if (e.key === "Escape") {
+            e.preventDefault();
+            setDraft(value);
+            setEditing(false);
+          }
+        }}
+        className="w-full rounded-lg border border-white/15 bg-black/40 px-2 py-1 text-sm text-white outline-none"
+      />
+    </li>
+  );
+}
+
+/** -----------------------------
+ * Resume Preview (2-column cards) with editing
+ * ----------------------------- */
+function ResumePreview({
+  resume,
+  onEdit,
+}: {
+  resume: TailoredResume;
+  onEdit: (next: TailoredResume) => void;
+}) {
   const h = resume.header;
 
   const meta = [
@@ -365,15 +346,15 @@ function ResumePreview({ resume }: { resume: TailoredResume }) {
 
   return (
     <div className="space-y-4">
-      {/* Header stays full width */}
+      {/* Header full width */}
       <div className="rounded-xl border border-white/10 bg-white/5 p-4">
         <div className="text-xl font-semibold">{h.name}</div>
         {meta && <div className="mt-1 text-sm text-white/70">{meta}</div>}
       </div>
 
-      {/* Two-column grid for the main cards (stacks on mobile) */}
+      {/* Two-column grid */}
       <div className="grid gap-4 lg:grid-cols-2 items-start">
-        {/* LEFT COLUMN */}
+        {/* LEFT */}
         <div className="space-y-4">
           <Section title="SUMMARY">
             <p className="text-sm text-white/90 leading-relaxed">{resume.summary || "—"}</p>
@@ -439,9 +420,7 @@ function ResumePreview({ resume }: { resume: TailoredResume }) {
                   <div key={idx} className="space-y-1">
                     <div className="text-sm font-semibold">
                       {e.school}
-                      {e.degree ? (
-                        <span className="font-normal text-white/80"> — {e.degree}</span>
-                      ) : null}
+                      {e.degree ? <span className="font-normal text-white/80"> — {e.degree}</span> : null}
                     </div>
                     <div className="text-xs text-white/60">
                       {[e.location, e.year].filter(Boolean).join(" • ")}
@@ -462,9 +441,9 @@ function ResumePreview({ resume }: { resume: TailoredResume }) {
           </Section>
         </div>
 
-        {/* RIGHT COLUMN */}
+        {/* RIGHT */}
         <div className="space-y-4">
-          <Section title="EXPERIENCE">
+          <Section title="EXPERIENCE (click bullets to edit)">
             {(resume.experience ?? []).length ? (
               <div className="space-y-4">
                 {resume.experience!.map((e, idx) => (
@@ -479,9 +458,20 @@ function ResumePreview({ resume }: { resume: TailoredResume }) {
                           .join(" • ")}
                       </div>
                     </div>
+
                     <ul className="list-disc pl-5 text-sm text-white/90 space-y-1">
                       {(e.bullets ?? []).filter(Boolean).map((b, i) => (
-                        <li key={i}>{b}</li>
+                        <EditableBullet
+                          key={i}
+                          value={b}
+                          onChange={(nextText) => {
+                            const next = structuredClone(resume);
+                            next.experience ??= [];
+                            next.experience[idx].bullets ??= [];
+                            next.experience[idx].bullets![i] = nextText;
+                            onEdit(next);
+                          }}
+                        />
                       ))}
                     </ul>
                   </div>
@@ -492,7 +482,7 @@ function ResumePreview({ resume }: { resume: TailoredResume }) {
             )}
           </Section>
 
-          <Section title="PROJECTS">
+          <Section title="PROJECTS (click bullets to edit)">
             {(resume.projects ?? []).length ? (
               <div className="space-y-4">
                 {resume.projects!.map((p, idx) => (
@@ -506,9 +496,20 @@ function ResumePreview({ resume }: { resume: TailoredResume }) {
                         </span>
                       ) : null}
                     </div>
+
                     <ul className="list-disc pl-5 text-sm text-white/90 space-y-1">
                       {(p.bullets ?? []).filter(Boolean).map((b, i) => (
-                        <li key={i}>{b}</li>
+                        <EditableBullet
+                          key={i}
+                          value={b}
+                          onChange={(nextText) => {
+                            const next = structuredClone(resume);
+                            next.projects ??= [];
+                            next.projects[idx].bullets ??= [];
+                            next.projects[idx].bullets![i] = nextText;
+                            onEdit(next);
+                          }}
+                        />
                       ))}
                     </ul>
                   </div>
@@ -580,7 +581,6 @@ function DocxViewer({ base64 }: { base64: string }) {
   );
 
   const [mounted, setMounted] = useState(false);
-
   useEffect(() => setMounted(true), []);
 
   useEffect(() => {
@@ -592,12 +592,7 @@ function DocxViewer({ base64 }: { base64: string }) {
     renderAsync(blob, container, undefined, {
       className: "docx",
       inWrapper: true,
-      ignoreWidth: false,
-      ignoreHeight: false,
-      ignoreFonts: false,
       breakPages: true,
-      renderChanges: false,
-      experimental: false,
     });
   }, [blob, mounted]);
 
@@ -618,29 +613,27 @@ export default function Home() {
   const [resumeText, setResumeText] = useState("");
 
   const [loading, setLoading] = useState(false);
+  const [regenerating, setRegenerating] = useState(false);
+
   const [data, setData] = useState<TailorResponse | null>(null);
+  const [editedResume, setEditedResume] = useState<TailoredResume | null>(null);
+
   const [error, setError] = useState<string | null>(null);
 
-  // Preview modal state
   const [preview, setPreview] = useState<
     | null
     | { kind: "pdf"; title: string; base64: string }
     | { kind: "docx"; title: string; base64: string }
   >(null);
 
-  // History state (loaded from localStorage on mount)
   const [history, setHistory] = useState<HistoryEntry[]>([]);
   const [historyInfo, setHistoryInfo] = useState<string | null>(null);
-
-  // Selected history item for UI highlighting
   const [selectedHistoryId, setSelectedHistoryId] = useState<string | null>(null);
 
   useEffect(() => {
-    const entries = safeLoadHistory();
-    setHistory(entries);
+    setHistory(safeLoadHistory());
   }, []);
 
-  // ✅ NEW: ATS analysis computed from job text + tailored resume (ATS text)
   const ats = useMemo(() => {
     if (!data) return null;
     return analyzeAts(jobText, data.tailored_resume || "");
@@ -659,7 +652,6 @@ export default function Home() {
   }
 
   function addToHistory(result: TailorResponse) {
-    // Try to save everything (including PDFs/DOCX). If quota fails, store text-only.
     const entryFull: HistoryEntry = {
       id: nowId(),
       createdAt: Date.now(),
@@ -677,7 +669,7 @@ export default function Home() {
       setHistoryInfo(null);
       return;
     } catch {
-      // likely QUOTA_EXCEEDED_ERR
+      // likely quota
     }
 
     const stripped: TailorResponse = {
@@ -700,17 +692,18 @@ export default function Home() {
       safeSaveHistory(next2);
       setHistory(next2);
       setHistoryInfo(
-        "Saved to history without PDF/DOCX files (browser storage limit). You can still view content; re-run Tailor to regenerate files."
+        "Saved to history without PDF/DOCX files (browser storage limit). Re-run Tailor to regenerate files."
       );
     } catch {
-      setHistoryInfo("Could not save to history (browser storage limit). Your current result is still on-screen.");
+      setHistoryInfo("Could not save to history (browser storage limit).");
     }
   }
 
   function openHistoryEntry(entry: HistoryEntry) {
     setError(null);
     setData(entry.result);
-    setSelectedHistoryId(entry.id); // ✅ highlight selected item
+    setEditedResume(entry.result.resume);
+    setSelectedHistoryId(entry.id);
     if (entry.jobPreview) setJobText(entry.jobPreview);
     setHistoryInfo(entry.hasFiles ? null : "This history item was saved without files (storage limit).");
     window.scrollTo({ top: 0, behavior: "smooth" });
@@ -721,11 +714,7 @@ export default function Home() {
     setHistory(next);
     try {
       safeSaveHistory(next);
-    } catch {
-      // ignore
-    }
-
-    // If you delete the selected item, clear selection
+    } catch {}
     if (selectedHistoryId === id) setSelectedHistoryId(null);
   }
 
@@ -734,17 +723,16 @@ export default function Home() {
     setSelectedHistoryId(null);
     try {
       localStorage.removeItem(HISTORY_KEY);
-    } catch {
-      // ignore
-    }
+    } catch {}
   }
 
   async function onTailor() {
     setLoading(true);
     setError(null);
     setData(null);
+    setEditedResume(null);
     setHistoryInfo(null);
-    setSelectedHistoryId(null); // ✅ new run, clear highlight
+    setSelectedHistoryId(null);
 
     try {
       const fd = new FormData();
@@ -757,7 +745,9 @@ export default function Home() {
       const json = await safeParseTailorResponse(res);
 
       if (!res.ok || json.error) throw new Error(json.error || `Request failed (${res.status})`);
+
       setData(json);
+      setEditedResume(json.resume);
       addToHistory(json);
     } catch (e: any) {
       setError(e?.message || "Something went wrong");
@@ -766,7 +756,51 @@ export default function Home() {
     }
   }
 
-  const canUseFiles = !!data?.resume_pdf_base64 && !!data?.cover_letter_pdf_base64;
+  async function onRegenerate() {
+    if (!data || !editedResume) return;
+
+    setRegenerating(true);
+    setError(null);
+
+    try {
+      const res = await fetch("/api/render", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          resume: editedResume,
+          cover_letter: data.cover_letter,
+        }),
+      });
+
+      const updated = await res.json();
+      if (!res.ok || updated.error) throw new Error(updated.error || `Regenerate failed (${res.status})`);
+
+      // Update current data with regenerated outputs (keep original_resume/job context)
+      const next: TailorResponse = {
+        ...data,
+        resume: updated.resume,
+        tailored_resume: updated.tailored_resume,
+        cover_letter: updated.cover_letter,
+        resume_pdf_base64: updated.resume_pdf_base64,
+        cover_letter_pdf_base64: updated.cover_letter_pdf_base64,
+        resume_docx_base64: updated.resume_docx_base64,
+        cover_letter_docx_base64: updated.cover_letter_docx_base64,
+      };
+
+      setData(next);
+      setEditedResume(updated.resume);
+    } catch (e: any) {
+      setError(e?.message || "Regenerate failed");
+    } finally {
+      setRegenerating(false);
+    }
+  }
+
+  const canUseFiles =
+    !!data?.resume_pdf_base64 &&
+    !!data?.cover_letter_pdf_base64 &&
+    !!data?.resume_docx_base64 &&
+    !!data?.cover_letter_docx_base64;
 
   return (
     <main className="min-h-screen px-6 py-10 bg-black text-white">
@@ -774,24 +808,24 @@ export default function Home() {
         <header className="space-y-2">
           <h1 className="text-4xl font-semibold">AI Resume & Cover Letter Tailor</h1>
           <p className="text-white/70">
-            Upload your resume as a PDF and paste the job description. Get a tailored resume + cover letter,
-            preview them, download as PDF/DOCX, and see ATS keyword match.
+            Upload your resume as a PDF and paste the job description. Tailor, edit bullets inline, then regenerate fresh PDFs/DOCX.
+          </p>
+          <p className="text-white/70">
+            Formatted for ATS parsing (no tables icons or columns)
           </p>
         </header>
 
-        {/* History Bar */}
+        {/* History */}
         <section className="rounded-2xl border border-white/10 bg-white/5 p-5">
           <div className="flex items-center justify-between gap-3">
             <div className="text-sm font-semibold">History (last {HISTORY_MAX})</div>
-            <div className="flex gap-2">
-              <button
-                onClick={clearHistory}
-                disabled={!history.length}
-                className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-sm text-white/80 hover:bg-white/10 disabled:opacity-40"
-              >
-                Clear all
-              </button>
-            </div>
+            <button
+              onClick={clearHistory}
+              disabled={!history.length}
+              className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-sm text-white/80 hover:bg-white/10 disabled:opacity-40"
+            >
+              Clear all
+            </button>
           </div>
 
           {historyInfo && <div className="mt-3 text-sm text-white/70">{historyInfo}</div>}
@@ -811,24 +845,17 @@ export default function Home() {
                     }
                   `}
                 >
-                  <button
-                    onClick={() => openHistoryEntry(h)}
-                    className="text-left flex-1"
-                    title="Open this saved result"
-                  >
+                  <button onClick={() => openHistoryEntry(h)} className="text-left flex-1">
                     <div className="text-sm font-medium text-white">{h.label}</div>
                     <div className="mt-1 text-xs text-white/60">
                       {formatDateTime(h.createdAt)}{" "}
-                      {!h.hasFiles ? (
-                        <span className="text-yellow-300/80">• no files saved</span>
-                      ) : null}
+                      {!h.hasFiles ? <span className="text-yellow-300/80">• no files saved</span> : null}
                     </div>
                   </button>
 
                   <button
                     onClick={() => deleteHistoryEntry(h.id)}
                     className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-white/80 hover:bg-white/10"
-                    title="Delete this history item"
                   >
                     Delete
                   </button>
@@ -849,7 +876,7 @@ export default function Home() {
               onChange={(e) => setResumePdf(e.target.files?.[0] ?? null)}
             />
             <p className="text-xs text-white/50">
-              If PDF parsing ever fails, you can paste your resume text below as a fallback.
+              If PDF parsing fails, paste your resume text below as fallback.
             </p>
 
             <label className="text-sm text-white/70 mt-4 block">Resume Text (fallback)</label>
@@ -872,7 +899,6 @@ export default function Home() {
           </div>
         </section>
 
-        {/* Action */}
         <button
           onClick={onTailor}
           disabled={!canSubmit}
@@ -881,13 +907,11 @@ export default function Home() {
           {loading ? "Tailoring..." : "Tailor for this job"}
         </button>
 
-        {/* Errors */}
         {error && <p className="text-red-400 whitespace-pre-wrap">{error}</p>}
 
-        {/* Results */}
         {data && (
           <section className="space-y-6 rounded-2xl border border-white/10 bg-white/5 p-6">
-            {/* ✅ NEW: ATS Score + keywords */}
+            {/* ATS Score */}
             {ats && (
               <div className="rounded-2xl border border-white/10 bg-black/30 p-5 space-y-4">
                 <div className="flex flex-wrap items-center justify-between gap-3">
@@ -905,17 +929,13 @@ export default function Home() {
                     className="rounded-xl px-4 py-2 bg-white/10 border border-white/15 text-white font-medium disabled:opacity-40"
                     disabled={ats.missing.length === 0}
                     onClick={() => navigator.clipboard.writeText(ats.missing.join(", "))}
-                    title="Copy missing keywords"
                   >
                     Copy missing keywords
                   </button>
                 </div>
 
-                {/* Missing */}
                 <div>
-                  <div className="text-sm font-semibold text-white/80">
-                    Missing keywords (from job post)
-                  </div>
+                  <div className="text-sm font-semibold text-white/80">Missing keywords</div>
                   <div className="mt-2 flex flex-wrap gap-2">
                     {ats.missing.length ? (
                       ats.missing.map((k) => (
@@ -931,33 +951,31 @@ export default function Home() {
                     )}
                   </div>
                 </div>
-
-                {/* Present */}
-                <div>
-                  <div className="text-sm font-semibold text-white/80">Present keywords</div>
-                  <div className="mt-2 flex flex-wrap gap-2">
-                    {ats.present.slice(0, 24).map((k) => (
-                      <span
-                        key={k}
-                        className="inline-flex items-center rounded-full border border-emerald-400/30 bg-emerald-500/10 px-3 py-1 text-xs text-emerald-200"
-                      >
-                        {k}
-                      </span>
-                    ))}
-                    {ats.present.length > 24 && (
-                      <span className="text-xs text-white/60">+{ats.present.length - 24} more</span>
-                    )}
-                  </div>
-                </div>
               </div>
             )}
 
-            {/* Download + Preview controls */}
+            {/* Regenerate from edits */}
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-white/10 bg-black/30 p-5">
+              <div>
+                <div className="text-sm font-semibold">Edits</div>
+                <div className="text-sm text-white/60">
+                  Click bullets in the cards to edit. When ready, regenerate PDFs/DOCX from your changes.
+                </div>
+              </div>
+
+              <button
+                onClick={onRegenerate}
+                disabled={!editedResume || regenerating}
+                className="rounded-xl px-4 py-2 bg-white text-black font-medium disabled:opacity-40"
+              >
+                {regenerating ? "Regenerating..." : "Regenerate files from edits"}
+              </button>
+            </div>
+
+            {/* Downloads + previews */}
             <div className="flex flex-wrap gap-3">
               <button
-                onClick={() =>
-                  downloadBase64(data.resume_pdf_base64, "tailored_resume.pdf", "application/pdf")
-                }
+                onClick={() => downloadBase64(data.resume_pdf_base64, "tailored_resume.pdf", "application/pdf")}
                 disabled={!data.resume_pdf_base64}
                 className="rounded-xl px-4 py-2 bg-white text-black font-medium disabled:opacity-40"
               >
@@ -965,9 +983,7 @@ export default function Home() {
               </button>
 
               <button
-                onClick={() =>
-                  downloadBase64(data.cover_letter_pdf_base64, "cover_letter.pdf", "application/pdf")
-                }
+                onClick={() => downloadBase64(data.cover_letter_pdf_base64, "cover_letter.pdf", "application/pdf")}
                 disabled={!data.cover_letter_pdf_base64}
                 className="rounded-xl px-4 py-2 bg-white/90 text-black font-medium disabled:opacity-40"
               >
@@ -1003,9 +1019,7 @@ export default function Home() {
               </button>
 
               <button
-                onClick={() =>
-                  setPreview({ kind: "pdf", title: "Resume PDF Preview", base64: data.resume_pdf_base64 })
-                }
+                onClick={() => setPreview({ kind: "pdf", title: "Resume PDF Preview", base64: data.resume_pdf_base64 })}
                 disabled={!data.resume_pdf_base64}
                 className="rounded-xl px-4 py-2 bg-white/5 border border-white/15 text-white font-medium disabled:opacity-40"
               >
@@ -1014,11 +1028,7 @@ export default function Home() {
 
               <button
                 onClick={() =>
-                  setPreview({
-                    kind: "pdf",
-                    title: "Cover Letter PDF Preview",
-                    base64: data.cover_letter_pdf_base64,
-                  })
+                  setPreview({ kind: "pdf", title: "Cover Letter PDF Preview", base64: data.cover_letter_pdf_base64 })
                 }
                 disabled={!data.cover_letter_pdf_base64}
                 className="rounded-xl px-4 py-2 bg-white/5 border border-white/15 text-white font-medium disabled:opacity-40"
@@ -1027,9 +1037,7 @@ export default function Home() {
               </button>
 
               <button
-                onClick={() =>
-                  setPreview({ kind: "docx", title: "Resume DOCX Preview", base64: data.resume_docx_base64 })
-                }
+                onClick={() => setPreview({ kind: "docx", title: "Resume DOCX Preview", base64: data.resume_docx_base64 })}
                 disabled={!data.resume_docx_base64}
                 className="rounded-xl px-4 py-2 bg-white/5 border border-white/15 text-white font-medium disabled:opacity-40"
               >
@@ -1038,11 +1046,7 @@ export default function Home() {
 
               <button
                 onClick={() =>
-                  setPreview({
-                    kind: "docx",
-                    title: "Cover Letter DOCX Preview",
-                    base64: data.cover_letter_docx_base64,
-                  })
+                  setPreview({ kind: "docx", title: "Cover Letter DOCX Preview", base64: data.cover_letter_docx_base64 })
                 }
                 disabled={!data.cover_letter_docx_base64}
                 className="rounded-xl px-4 py-2 bg-white/5 border border-white/15 text-white font-medium disabled:opacity-40"
@@ -1052,13 +1056,12 @@ export default function Home() {
 
               {!canUseFiles && (
                 <div className="w-full text-sm text-yellow-300/80">
-                  This result doesn’t include saved PDF/DOCX files (storage limit). You can still read the
-                  content and re-run Tailor to regenerate files.
+                  This result doesn’t include saved files (storage limit). Re-run Tailor or Regenerate.
                 </div>
               )}
             </div>
 
-            {/* Side-by-side comparison + preview */}
+            {/* Preview area */}
             <div className="grid gap-4 md:grid-cols-2">
               <div className="rounded-xl border border-white/10 bg-black/30 p-4">
                 <h2 className="text-lg font-semibold">Original Resume (extracted)</h2>
@@ -1068,13 +1071,11 @@ export default function Home() {
               </div>
 
               <div className="space-y-4">
-                <h2 className="text-lg font-semibold">Tailored Resume (preview)</h2>
-                <ResumePreview resume={data.resume} />
+                <h2 className="text-lg font-semibold">Tailored Resume (cards)</h2>
+                {editedResume && <ResumePreview resume={editedResume} onEdit={setEditedResume} />}
 
                 <div className="rounded-xl border border-white/10 bg-black/30 p-4">
-                  <h3 className="text-sm font-semibold text-white/80">
-                    ATS Text (what the PDF is based on)
-                  </h3>
+                  <h3 className="text-sm font-semibold text-white/80">ATS Text (generated / regenerated)</h3>
                   <pre className="mt-3 whitespace-pre-wrap text-sm leading-relaxed text-white/90">
                     {data.tailored_resume}
                   </pre>
@@ -1092,14 +1093,10 @@ export default function Home() {
         )}
       </div>
 
-      {/* Preview modal */}
+      {/* Modal */}
       {preview && (
         <Modal title={preview.title} onClose={() => setPreview(null)}>
-          {preview.kind === "pdf" ? (
-            <PdfViewer base64={preview.base64} />
-          ) : (
-            <DocxViewer base64={preview.base64} />
-          )}
+          {preview.kind === "pdf" ? <PdfViewer base64={preview.base64} /> : <DocxViewer base64={preview.base64} />}
         </Modal>
       )}
     </main>

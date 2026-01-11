@@ -19,6 +19,13 @@ function clamp(s: string) {
   return cleaned.length > MAX_CHARS ? cleaned.slice(0, MAX_CHARS) : cleaned;
 }
 
+const encoder = new TextEncoder();
+
+function sse(event: string, data: any) {
+  return encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+}
+
+
 function safeJsonParse<T>(text: string): T | null {
   try {
     return JSON.parse(text) as T;

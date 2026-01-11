@@ -71,13 +71,13 @@ export function formatResumeATS(resume: TailoredResume): string {
   out.push("");
 
   // SUMMARY
-  out.push("## SUMMARY");
+  out.push("-- SUMMARY --");
   if (clean(resume.summary)) out.push(resume.summary!.trim());
   else out.push("—");
   out.push("");
 
   // SKILLS
-  out.push("## SKILLS");
+  out.push("-- SKILLS --");
   const s = resume.skills ?? {};
   const skillsLines: string[] = [];
   if ((s.languages ?? []).length) skillsLines.push(`Languages: ${(s.languages ?? []).join(", ")}`);
@@ -89,7 +89,7 @@ export function formatResumeATS(resume: TailoredResume): string {
   out.push("");
 
   // EXPERIENCE
-  out.push("## EXPERIENCE");
+  out.push("-- EXPERIENCE --");
   const exp = resume.experience ?? [];
   if (!exp.length) {
     out.push("—");
@@ -108,7 +108,7 @@ export function formatResumeATS(resume: TailoredResume): string {
   }
 
   // PROJECTS
-  out.push("## PROJECTS");
+  out.push("-- PROJECTS --");
   const proj = resume.projects ?? [];
   if (!proj.length) {
     out.push("—");
@@ -126,7 +126,7 @@ export function formatResumeATS(resume: TailoredResume): string {
   }
 
   // EDUCATION
-  out.push("## EDUCATION");
+  out.push("-- EDUCATION --");
   const edu = resume.education ?? [];
   if (!edu.length) {
     out.push("—");
